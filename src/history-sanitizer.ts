@@ -82,23 +82,25 @@ export function sanitizeForNonAcpModel(messages: any[]): void {
       }
 
       if (msg.role === "assistant") {
+        const toolName = String(part.name ?? part.toolName ?? "")
         const isAcpHosted =
           (part.type === "tool-call" || part.type === "tool-result") &&
           part.providerExecuted === true &&
           (Boolean(part.providerMetadata?.[ACP_PROVIDER_ID]) ||
-            String(part.name ?? "").startsWith("acp_"))
+            part.providerOptions?.[ACP_PROVIDER_ID]?.acp === true ||
+            toolName.startsWith("acp_"))
 
         if (isAcpHosted) {
           changed = true
           if (part.type === "tool-call") {
             nextContent.push({
               type: "text",
-              text: `[Antigravity tool call \`${part.name}\`: ${stringifyCompact(part.input, 1200)}]`,
+              text: `[Antigravity tool call \`${toolName}\`: ${stringifyCompact(part.input, 1200)}]`,
             })
           } else {
             nextContent.push({
               type: "text",
-              text: `[Antigravity tool \`${part.name}\` result: ${summarizeToolResultValue(part.result)}]`,
+              text: `[Antigravity tool \`${toolName}\` result: ${summarizeToolResultValue(part.result)}]`,
             })
           }
           continue

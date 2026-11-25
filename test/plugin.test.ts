@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -35,6 +35,26 @@ import {
   quotaBucketForModel,
   resetSharedCatalogForTests,
 } from "../src/session-bridge.js"
+
+const bridgeEnv = [
+  "ANTIGRAVITY_ACP_NATIVE_TOOLS",
+  "ANTIGRAVITY_ACP_DEBUG_TOOLS",
+  "ANTIGRAVITY_ACP_DEBUG_TOOLS_FILE",
+  "ANTIGRAVITY_ACP_PREAMBLE",
+] as const
+let previousBridgeEnv: (string | undefined)[]
+beforeEach(() => {
+  previousBridgeEnv = bridgeEnv.map((key) => process.env[key])
+  for (const key of bridgeEnv) delete process.env[key]
+  process.env.ANTIGRAVITY_ACP_PREAMBLE = "off"
+})
+afterEach(() => {
+  for (const [index, key] of bridgeEnv.entries()) {
+    const value = previousBridgeEnv[index]
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+})
 
 function makeMockCtx(initialStorage?: Record<string, unknown>) {
   const store = new Map<string, unknown>(Object.entries(initialStorage ?? {}))
@@ -181,27 +201,102 @@ describe("SessionBridgeManager native ACP tool results", () => {
 
   test("keeps the announced tool name on terminal updates with an omitted or changed name", async () => {
     const parts = await streamToolUpdates([
-      { sessionUpdate: "tool_call", toolCallId: "read", name: "read_file", status: "pending" },
-      { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", status: "in_progress" },
+      { sessionUpdate: "tool_call", toolCallId: "read", name: "read_file", status: "pending", rawInput: { Path: "/repo/a" } },
+      { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", status: "in_progress", title: "Print directory", rawInput: { CommandLine: "pwd", WaitMsBeforeAsync: 1000 } },
       { sessionUpdate: "tool_call_update", toolCallId: "read", status: "completed", rawOutput: "file text" },
-      { sessionUpdate: "tool_call_update", toolCallId: "run", name: "execute", status: "failed", rawOutput: "command failed" },
+      { sessionUpdate: "tool_call_update", toolCallId: "run", name: "read_file", status: "failed", rawOutput: "command failed" },
     ])
 
     const calls = parts.filter((p) => p.type === "tool-call")
-    expect(calls.map((p) => [p.toolCallId, p.toolName])).toEqual([
-      ["read", "acp_read_file"],
-      ["run", "acp_run_command"],
+    expect(calls.map((p) => [p.toolCallId, p.toolName, JSON.parse(p.input), p.providerExecuted])).toEqual([
+      ["read", "read", { filePath: "/repo/a" }, true],
+      ["run", "bash", { description: "Print directory", command: "pwd" }, true],
     ])
+    expect(calls.every((p) => p.providerMetadata?.["antigravity-acp"]?.acp === true)).toBe(true)
+    expect(parts.filter((p) => p.type === "tool-input-start").every(
+      (p) => p.providerMetadata?.["antigravity-acp"]?.acp === true,
+    )).toBe(true)
     const results = parts.filter((p) => p.type === "tool-result")
     expect(results.map((p) => [p.toolCallId, p.toolName, p.result, p.isError])).toEqual([
-      ["read", "acp_read_file", "file text", false],
-      ["run", "acp_run_command", "command failed", true],
+      ["read", "read", "file text", false],
+      ["run", "bash", "command failed", true],
     ])
+  })
+
+  test("does not emit mapped native parts for relayed MCP updates", async () => {
+    const parts = await streamToolUpdates([
+      { sessionUpdate: "tool_call", toolCallId: "relay", name: "mcp_oc_execute", kind: "execute" },
+      { sessionUpdate: "tool_call_update", toolCallId: "relay", name: "run_command", status: "completed" },
+    ])
+    expect(parts.filter((p) => ["tool-input-start", "tool-call", "tool-result"].includes(p.type))).toEqual([])
+  })
+
+  test("restores legacy display names and raw inputs with native tools off", async () => {
+    process.env.ANTIGRAVITY_ACP_NATIVE_TOOLS = "off"
+    const rawInput = { CommandLine: "pwd", WaitMsBeforeAsync: 1000 }
+    const parts = await streamToolUpdates([
+      { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", kind: "execute", title: "Directory", rawInput },
+      { sessionUpdate: "tool_call_update", toolCallId: "run", status: "completed" },
+    ])
+    expect(parts.find((p) => p.type === "tool-call")).toMatchObject({
+      toolName: "acp_run_command", input: JSON.stringify(rawInput), providerExecuted: true,
+    })
+    expect(parts.find((p) => p.type === "tool-result")?.toolName).toBe("acp_run_command")
+  })
+
+  test.skipIf(process.platform === "win32")("logs the first tool shape only after opt-in, with a private file and truncated strings", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-tool-log-"))
+    const file = path.join(dir, "calls.jsonl")
+    process.env.ANTIGRAVITY_ACP_DEBUG_TOOLS_FILE = file
+    const rawInput = { sample: "x ".repeat(175), short: "value" }
+    const updates = [
+      { sessionUpdate: "tool_call", toolCallId: "a", name: "diagnostic_tool", kind: "other", rawInput },
+      { sessionUpdate: "tool_call", toolCallId: "b", name: "diagnostic_tool", kind: "other", rawInput: { sample: "not first" } },
+      { sessionUpdate: "tool_call", toolCallId: "c", name: "diagnostic_tool", kind: "execute", rawInput: { CommandLine: "pwd" } },
+    ] as const
+    try {
+      await streamToolUpdates(updates)
+      expect(fs.existsSync(file)).toBe(false)
+      process.env.ANTIGRAVITY_ACP_DEBUG_TOOLS = "true"
+      await streamToolUpdates(updates)
+      expect(fs.existsSync(file)).toBe(false)
+      process.env.ANTIGRAVITY_ACP_DEBUG_TOOLS = "1"
+      await streamToolUpdates(updates)
+      const lines = fs.readFileSync(file, "utf8").trimEnd().split("\n")
+      expect(lines.map((line) => JSON.parse(line))).toEqual([
+        { name: "diagnostic_tool", kind: "other", rawInput: { ...rawInput, sample: "x ".repeat(150) }, mappedTo: "acp_diagnostic_tool" },
+        { name: "diagnostic_tool", kind: "execute", rawInput: { CommandLine: "pwd" }, mappedTo: "bash" },
+      ])
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("refuses a symlink or a shared file without interrupting the tool stream", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-tool-log-"))
+    const file = path.join(dir, "calls.jsonl")
+    const link = path.join(dir, "link.jsonl")
+    process.env.ANTIGRAVITY_ACP_DEBUG_TOOLS = "1"
+    try {
+      fs.writeFileSync(file, "unchanged", { mode: 0o600 })
+      fs.symlinkSync(file, link)
+      process.env.ANTIGRAVITY_ACP_DEBUG_TOOLS_FILE = link
+      await streamToolUpdates([{ sessionUpdate: "tool_call", toolCallId: "a", name: "linked_log_shape", status: "completed" }])
+      expect(fs.readFileSync(file, "utf8")).toBe("unchanged")
+      fs.chmodSync(file, 0o644)
+      process.env.ANTIGRAVITY_ACP_DEBUG_TOOLS_FILE = file
+      const parts = await streamToolUpdates([{ sessionUpdate: "tool_call", toolCallId: "a", name: "shared_log_shape", status: "completed" }])
+      expect(fs.readFileSync(file, "utf8")).toBe("unchanged")
+      expect(parts.find((p) => p.type === "tool-result")?.toolName).toBe("acp_shared_log_shape")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test("marks an unfinished tool as unknown with its original name when the turn ends", async () => {
     const parts = await streamToolUpdates([
-      { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", status: "pending" },
+      { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", status: "pending", rawInput: { CommandLine: "pwd" } },
       { sessionUpdate: "tool_call_update", toolCallId: "run", status: "in_progress", kind: "execute" },
     ])
 
@@ -209,7 +304,7 @@ describe("SessionBridgeManager native ACP tool results", () => {
     expect(results).toHaveLength(1)
     expect(results[0]).toMatchObject({
       toolCallId: "run",
-      toolName: "acp_run_command",
+      toolName: "bash",
       result: { status: "unknown" },
       isError: true,
     })
@@ -218,14 +313,14 @@ describe("SessionBridgeManager native ACP tool results", () => {
 
   test("uses the result when the initial tool call already reports a terminal status", async () => {
     const parts = await streamToolUpdates([
-      { sessionUpdate: "tool_call", toolCallId: "read", kind: "read", status: "completed", rawOutput: "file text" },
+      { sessionUpdate: "tool_call", toolCallId: "read", kind: "read", status: "completed", rawInput: { Path: "/repo/a" }, rawOutput: "file text" },
     ])
 
     const results = parts.filter((p) => p.type === "tool-result")
     expect(results).toHaveLength(1)
     expect(results[0]).toMatchObject({
       toolCallId: "read",
-      toolName: "acp_read",
+      toolName: "read",
       result: "file text",
       isError: false,
     })
@@ -291,6 +386,7 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
       toolCallId: "native-1",
       name: "run_command",
       status: "in_progress",
+      rawInput: { CommandLine: "pwd" },
     })
 
     const streamReaderPromise = readAllParts(activeStream)
@@ -301,7 +397,7 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
     expect(midTurnParts.some((p) => p.type === "error")).toBe(false)
     expect(midTurnParts.find((p) => p.type === "tool-result")).toMatchObject({
       toolCallId: "native-1",
-      toolName: "acp_run_command",
+      toolName: "bash",
       result: { status: "unknown" },
       isError: true,
     })
