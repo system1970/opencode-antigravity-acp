@@ -150,6 +150,61 @@ describe("McpRelayServer", () => {
 })
 
 describe("SessionBridgeManager native ACP tool results", () => {
+  test.each([0, 1, 2])("rejects late and %i queued relay calls after ACP settles while preserving dispatched results", async (count) => {
+    let settle!: (value: any) => void
+    const prompt = new Promise<any>((resolve) => { settle = resolve })
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+      createProc: () => ({
+        isClosed: false, initialize: async () => ({}), authenticate: async () => ({}),
+        newSession: async () => ({ sessionId: "acp-relay" }), setModel: async () => {},
+        setMode: async () => {}, notifyCancel: () => {}, dispose: async () => {},
+        prompt: () => prompt,
+      } as any),
+    })
+    const lm = bridge.createLanguageModel("gemini-4-neon")
+    const headers = { "x-opencode-session-id": "relay-test" }
+    const user = { role: "user", content: [{ type: "text", text: "Run tools" }] }
+    const firstStream = (await lm.doStream({ prompt: [user], headers } as any)).stream
+    const session = (bridge as any).sessions.get("relay-test")
+    const turn = session.activeTurn
+    const first = (bridge as any).handleIncomingMcpCall("relay-test", "execute", {}, new AbortController().signal)
+    ;(bridge as any).tryFlushToolCalls(session, turn)
+    const firstParts = await readAllParts(firstStream)
+    const call = firstParts.find((p) => p.type === "tool-call")
+    const abort = new AbortController()
+    const queuedResults: any[] = []
+    const queued = Array.from({ length: count }, () =>
+      (bridge as any).handleIncomingMcpCall("relay-test", "execute", {}, abort.signal)
+        .then((result: any) => { queuedResults.push(result) }),
+    )
+    settle({ stopReason: "end_turn" })
+    await prompt
+    await Promise.resolve()
+    await Promise.resolve()
+    let lateResult: any
+    const late = (bridge as any).handleIncomingMcpCall("relay-test", "execute", {}, new AbortController().signal)
+      .then((result: any) => { lateResult = result })
+    await Promise.resolve()
+    await Promise.resolve()
+    try {
+      expect(queuedResults.map((result) => result.isError)).toEqual(Array(count).fill(true))
+      expect(lateResult?.isError).toBe(true)
+      expect(turn.pendingMcpCalls.size).toBe(1)
+      abort.abort()
+      await Promise.all(queued)
+      await late
+      const next = await readAllParts((await lm.doStream({
+        prompt: [user, { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId,
+          toolName: "execute", output: { type: "text", value: "actual result" } }] }], headers,
+      } as any)).stream)
+      expect(await first).toEqual({ content: [{ type: "text", text: "actual result" }], isError: false })
+      expect(next.filter((p) => p.type === "tool-call")).toHaveLength(0)
+      expect(next.at(-1)?.finishReason?.unified).toBe("stop")
+    } finally {
+      await bridge.disposeAll()
+    }
+  })
+
   async function streamToolUpdates(updates: readonly AcpSessionUpdate[]) {
     const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
       createProc: ({ onUpdate }) => ({

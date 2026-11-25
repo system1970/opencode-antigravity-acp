@@ -112,6 +112,7 @@ interface PendingMcpCall {
   resolved: boolean
   readonly resolve: (res: McpCallToolResult) => void
   abortCleanup?: () => void
+  readonly userQuestion?: boolean
   /** agy's own pending ask_question call, closed when the question is shown. */
   readonly nativeToolCallId?: string
   /**
@@ -1807,6 +1808,7 @@ export class SessionBridgeManager {
         emittedToOpenCode: false,
         resolved: false,
         resolve,
+        userQuestion: true,
         nativeToolCallId,
         bypassNativeTools: nativeToolCallId === undefined,
       })
@@ -1847,7 +1849,7 @@ export class SessionBridgeManager {
   ): Promise<McpCallToolResult> {
     const s = this.sessions.get(sessionID)
     const turn = s?.activeTurn
-    if (!s || !turn) {
+    if (!s || !turn || turn.promptSettled) {
       return {
         content: [{ type: "text", text: "No active Antigravity turn to execute OpenCode tool." }],
         isError: true,
@@ -1897,7 +1899,9 @@ export class SessionBridgeManager {
 
   private tryFlushToolCalls(s: BridgeSession, turn: ActiveTurn): void {
     if (!turn.controller) return
-    const unsent = [...turn.pendingMcpCalls.values()].filter((c) => !c.emittedToOpenCode)
+    const unsent = [...turn.pendingMcpCalls.values()].filter(
+      (c) => !c.emittedToOpenCode && (!turn.promptSettled || c.userQuestion),
+    )
     if (unsent.length === 0) return
 
     // agy's own ask_question call stays open until it is answered, so close
@@ -2727,6 +2731,19 @@ export class SessionBridgeManager {
               if (turn.flushTimer) {
                 clearTimeout(turn.flushTimer)
                 turn.flushTimer = undefined
+              }
+              for (const [id, call] of turn.pendingMcpCalls) {
+                if (call.emittedToOpenCode || call.userQuestion) continue
+                turn.pendingMcpCalls.delete(id)
+                try { call.abortCleanup?.() } catch {}
+                call.abortCleanup = undefined
+                if (!call.resolved) {
+                  call.resolved = true
+                  call.resolve({
+                    content: [{ type: "text", text: "Turn ended before OpenCode tool dispatch." }],
+                    isError: true,
+                  })
+                }
               }
               // Wait if any OpenCode tool call is still mid-roundtrip (shouldn't happen before HTTP reply, unless aborted)
               if (turn.dispatchedCallIds.size === 0 && turn.controller) {
