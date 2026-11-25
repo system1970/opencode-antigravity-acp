@@ -33,6 +33,7 @@ import {
   isSyntheticRestartAfterError,
 } from "./history-sanitizer.js"
 import { McpRelayServer, type McpCallToolResult, type McpToolDescriptor } from "./mcp-relay.js"
+import { acquireConversationLock, LockHold } from "./conversation-lock.js"
 import {
   elicitationToQuestions,
   parseQuestionToolAnswers,
@@ -50,6 +51,14 @@ class PluginDisposedError extends Error {
     this.name = "PluginDisposedError"
   }
 }
+
+class ConversationLockError extends Error {
+  constructor(readonly busy: boolean) { super(busy ? "Conversation is in use" : "Conversation lock is unavailable") }
+}
+
+const BUSY_TEXT = "Another Antigravity process is still using this conversation. Nothing was sent. Send a new message after it has stopped."
+const LOCK_UNAVAILABLE_TEXT = "Antigravity could not take the single-writer lock, so nothing was started."
+const RESET_BUSY_TEXT = "Another Antigravity process is still using this conversation, so it was not reset."
 
 /**
  * Thrown when an in-flight `ensureAcpSession` start is invalidated by a
@@ -143,6 +152,7 @@ interface ActiveTurn {
 }
 
 interface BridgeSession {
+  hold?: LockHold
   readonly sessionID: string
   cwd: string
   mode: AcpMode
@@ -439,7 +449,15 @@ export class SessionBridgeManager {
     this.onStateChanged = onStateChanged
     this.onCatalogChanged = options?.onCatalogChanged
     this.discoverModelsFn = options?.discoverModels ?? ((cwd) => discoverAcpModels(cwd))
-    this.createProcFn = options?.createProc ?? ((opts) => new AcpProcess(opts))
+    this.createProcFn = options?.createProc ? (opts) => {
+      const release = opts.lockHold?.ref()
+      try {
+        const proc = options.createProc!({ ...opts, onExit: (...args) => { release?.(); opts.onExit?.(...args) } })
+        const dispose = proc.dispose.bind(proc)
+        proc.dispose = async () => { try { await dispose() } finally { release?.() } }
+        return proc
+      } catch (err) { release?.(); throw err }
+    } : ((opts) => new AcpProcess(opts))
     if (sharedCatalog && sharedCatalog.length > 0) {
       this.catalog = sharedCatalog
     }
@@ -727,8 +745,8 @@ export class SessionBridgeManager {
    * Pre-warm `agy acp` in the background so the first real turn doesn't pay
    * a cold spawn. With a real session ID the session's own `ensureAcpSession`
    * runs (deduplicated via `s.startLock`); with an empty ID (unsaved new tab)
-   * a spare initialized + authenticated proc is parked for the first real
-   * `ses_...` session to claim. Never throws — the foreground turn surfaces
+   * on non-Linux platforms a spare initialized + authenticated proc is parked
+   * for the first real `ses_...` session to claim. Never throws — the foreground turn surfaces
    * and retries any failure itself.
    *
    * Note: a warm may create the ACP session before `contextSnapshot` exists,
@@ -756,7 +774,7 @@ export class SessionBridgeManager {
       }
       return this.getState(sessionID)
     }
-    void this.ensureWarmSpare().catch(() => {})
+    if (process.platform !== "linux") void this.ensureWarmSpare().catch(() => {})
     return this.getState("")
   }
 
@@ -922,9 +940,32 @@ export class SessionBridgeManager {
     return this.getState(sessionID)
   }
 
+  private async claimReset(s: BridgeSession): Promise<(() => void) | undefined> {
+    const first = await acquireConversationLock("session", s.sessionID)
+    if (first.kind === "unguarded") return undefined
+    if (first.kind !== "held") throw new ConversationLockError(first.kind === "busy")
+    const hold = new LockHold([first.fd])
+    const release = hold.ref()!
+    try {
+      const value = await Effect.runPromise(this.ctx.storage.get(`${STORAGE_KEY_PREFIX}${s.sessionID}`))
+      if (typeof value === "string" && value.length > 0) {
+        const second = await acquireConversationLock("native", value)
+        if (second.kind !== "held") throw new ConversationLockError(second.kind === "busy")
+        hold.add(second.fd)
+      }
+      s.hold = hold
+      return release
+    } catch (err) {
+      release()
+      if (err instanceof ConversationLockError) throw err
+      throw new ConversationLockError(false)
+    }
+  }
+
   async resetSession(sessionID: string): Promise<SessionPublicState> {
     const s = this.sessions.get(sessionID)
     if (s) {
+      let claim = s.hold?.ref()
       // Publish a completion barrier BEFORE doing anything async: joiners in
       // ensureAcpSession (and its stale-start retry) await this lock, so a
       // replacement session never reads storage or spawns until our cleanup —
@@ -957,6 +998,14 @@ export class SessionBridgeManager {
             await inFlight
           } catch {}
         }
+        claim ??= s.hold?.ref()
+        if (!claim) {
+          try { claim = await this.claimReset(s) } catch (err) {
+            s.lastError = err instanceof ConversationLockError && err.busy ? RESET_BUSY_TEXT : LOCK_UNAVAILABLE_TEXT
+            this.notifyChanged(sessionID)
+            return this.getState(sessionID)
+          }
+        }
         await this.handleInterrupt(sessionID, "Session reset by user")
         if (s.proc) {
           const proc = s.proc
@@ -979,6 +1028,7 @@ export class SessionBridgeManager {
         this.untrackWarmedIdle(sessionID)
         await this.runStorageRemove(sessionID)
       } finally {
+        claim?.()
         if (s.resetLock === resetGate) s.resetLock = undefined
         releaseReset()
       }
@@ -1007,6 +1057,7 @@ export class SessionBridgeManager {
   async softResetForHandoff(sessionID: string): Promise<SessionPublicState> {
     const s = this.sessions.get(sessionID)
     if (s) {
+      let claim = s.hold?.ref()
       let releaseReset!: () => void
       const resetGate = new Promise<void>((r) => {
         releaseReset = r
@@ -1026,6 +1077,14 @@ export class SessionBridgeManager {
           try {
             await inFlight
           } catch {}
+        }
+        claim ??= s.hold?.ref()
+        if (!claim) {
+          try { claim = await this.claimReset(s) } catch (err) {
+            s.lastError = err instanceof ConversationLockError && err.busy ? RESET_BUSY_TEXT : LOCK_UNAVAILABLE_TEXT
+            this.notifyChanged(sessionID)
+            throw err
+          }
         }
         await this.handleInterrupt(sessionID, "Session reset for handoff")
         const settling = s.settlingPrompt
@@ -1073,6 +1132,7 @@ export class SessionBridgeManager {
         this.untrackWarmedIdle(sessionID)
         await this.runStorageRemove(sessionID)
       } finally {
+        claim?.()
         if (s.resetLock === resetGate) s.resetLock = undefined
         releaseReset!()
       }
@@ -1279,17 +1339,21 @@ export class SessionBridgeManager {
   }
 
   private async runStorageSet(sessionID: string, acpSessionId: string): Promise<void> {
+    const claim = this.sessions.get(sessionID)?.hold?.ref()
+    if (process.platform === "linux" && !claim) return
     try {
       await Effect.runPromise(
         this.ctx.storage.set(`${STORAGE_KEY_PREFIX}${sessionID}`, acpSessionId),
       )
-    } catch {}
+    } catch {} finally { claim?.() }
   }
 
   private async runStorageRemove(sessionID: string): Promise<void> {
+    const claim = this.sessions.get(sessionID)?.hold?.ref()
+    if (process.platform === "linux" && !claim) return
     try {
       await Effect.runPromise(this.ctx.storage.remove(`${STORAGE_KEY_PREFIX}${sessionID}`))
-    } catch {}
+    } catch {} finally { claim?.() }
   }
 
   private async ensureAcpSession(
@@ -1400,6 +1464,7 @@ export class SessionBridgeManager {
     // the start closure are invisible to outer control-flow narrowing, which
     // would otherwise shrink a plain `let` to its `undefined` initializer.
     const adoption: { winner?: { proc: AcpProcess; acpSessionId: string } } = {}
+    let releaseStart: (() => void) | undefined
     const startPromise = (async () => {
       try {
         const info = await Effect.runPromise(
@@ -1422,6 +1487,37 @@ export class SessionBridgeManager {
       if (this.disposed) throw new PluginDisposedError()
       throwIfStale()
 
+      let hold = s.hold
+      releaseStart = hold?.ref()
+      let newHold = false
+      if (!releaseStart) {
+        const result = await acquireConversationLock("session", s.sessionID)
+        if (result.kind === "busy") throw new ConversationLockError(true)
+        if (result.kind === "unavailable") throw new ConversationLockError(false)
+        if (result.kind === "held") {
+          hold = new LockHold([result.fd])
+          releaseStart = hold.ref()
+          newHold = true
+        } else hold = undefined
+      }
+      throwIfStale()
+      let storedId: string | undefined
+      if (hold) {
+        try {
+          const value = await Effect.runPromise(this.ctx.storage.get(`${STORAGE_KEY_PREFIX}${s.sessionID}`))
+          storedId = typeof value === "string" && value.length > 0 ? value : undefined
+        } catch { throw new ConversationLockError(false) }
+        throwIfStale()
+        if (newHold && storedId) {
+          const result = await acquireConversationLock("native", storedId)
+          if (result.kind === "busy") throw new ConversationLockError(true)
+          if (result.kind !== "held") throw new ConversationLockError(false)
+          hold.add(result.fd)
+          throwIfStale()
+        }
+      }
+      if (newHold) s.hold = hold
+
       let disposedByBridge = false
       // Reuse the session's live proc when it survived a soft handoff reset
       // (no respawn/re-auth: MCP servers attach per session/new). Otherwise
@@ -1434,7 +1530,7 @@ export class SessionBridgeManager {
       if (s.proc && !s.proc.isClosed) {
         proc = s.proc
         reusedLiveProc = true
-      } else if (spare && !spare.proc.isClosed && spare.cwd === s.cwd && !spare.holder.owner) {
+      } else if (!hold && spare && !spare.proc.isClosed && spare.cwd === s.cwd && !spare.holder.owner) {
         this.warmSpare = undefined
         spare.holder.owner = s
         proc = spare.proc
@@ -1442,6 +1538,7 @@ export class SessionBridgeManager {
       } else {
         proc = this.createProcFn({
           cwd: s.cwd,
+          lockHold: hold,
           dangerouslySkipPermissions: false,
           onUpdate: (_sid, update) => this.handleAcpUpdate(s, update),
           onPermissionRequest: (params) => this.handlePermissionRequest(s, params),
@@ -1484,7 +1581,7 @@ export class SessionBridgeManager {
             ]
           : []
 
-        const storedId = s.acpSessionId ?? (await this.runStorageGet(s.sessionID))
+        if (!hold) storedId = s.acpSessionId ?? (await this.runStorageGet(s.sessionID))
         if (s.startGeneration !== startGeneration) throw new StaleAcpStartError()
         if (this.disposed) throw new PluginDisposedError()
         let res: any
@@ -1576,6 +1673,7 @@ export class SessionBridgeManager {
     })()
 
     s.startLock = startPromise.finally(() => {
+      releaseStart?.()
       s.startLock = undefined
     })
     try {
@@ -2596,14 +2694,18 @@ export class SessionBridgeManager {
         // session on the SAME live proc (no respawn/re-auth) and sends a
         // plain-text-only handoff (no tool/reasoning replay).
         const needsHandoff = hasUnseenNonAcpAssistantHistory(options.prompt)
-        if (needsHandoff) {
-          await bridge.softResetForHandoff(sessionID)
+        const lockFailure = (err: ConversationLockError) => {
+          const text = err.busy ? BUSY_TEXT : LOCK_UNAVAILABLE_TEXT
+          s.lastError = text
+          bridge.notifyChanged(sessionID)
+          return { stream: bridge.createImmediateTextStream(text, err.busy ? "agy_session_busy" : "agy_lock_unavailable") }
         }
-
         let ensured: { proc: AcpProcess; acpSessionId: string; freshSession: boolean }
         try {
+          if (needsHandoff) await bridge.softResetForHandoff(sessionID)
           ensured = await bridge.ensureAcpSession(s)
         } catch (err) {
+          if (err instanceof ConversationLockError) return lockFailure(err)
           if (err instanceof PluginDisposedError || bridge.disposed) {
             return {
               stream: bridge.createImmediateTextStream(
@@ -2657,7 +2759,11 @@ export class SessionBridgeManager {
           (s.proc !== undefined && s.proc !== proc) ||
           (s.acpSessionId !== undefined && s.acpSessionId !== acpSessionId)
         if (isStaleInstall()) {
-          const retry = await bridge.ensureAcpSession(s)
+          let retry: { proc: AcpProcess; acpSessionId: string; freshSession: boolean }
+          try { retry = await bridge.ensureAcpSession(s) } catch (err) {
+            if (err instanceof ConversationLockError) return lockFailure(err)
+            throw err
+          }
           proc = retry.proc
           acpSessionId = retry.acpSessionId
           freshSession = freshSession || retry.freshSession

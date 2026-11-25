@@ -3,6 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { StringDecoder } from "node:string_decoder"
+import type { LockHold } from "./conversation-lock.js"
 
 export class AgyNotFoundError extends Error {
   constructor(binary: string) {
@@ -375,6 +376,7 @@ export function resolveAcpModelTarget(
 }
 
 export interface AcpProcessOptions {
+  readonly lockHold?: LockHold
   readonly cwd: string
   readonly binaryPath?: string
   readonly extraDirs?: readonly string[]
@@ -470,6 +472,7 @@ export function buildAgySpawnEnv(
 }
 
 export class AcpProcess {
+  private unlock?: () => void
   private proc: ChildProcessWithoutNullStreams
   private nextId = 1
   private pending = new Map<number, PendingRpc>()
@@ -492,12 +495,21 @@ export class AcpProcess {
 
     const binary = options.binaryPath ?? resolveAgyBinary()
     this.binary = binary
-    this.proc = spawn(binary, args, {
-      cwd: options.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: buildAgySpawnEnv(),
-      detached: process.platform !== "win32",
-    })
+    if (options.lockHold) {
+      this.unlock = options.lockHold.ref()
+      if (!this.unlock) throw new Error("conversation lock was already released")
+    }
+    try {
+      this.proc = spawn(binary, args, {
+        cwd: options.cwd,
+        stdio: ["pipe", "pipe", "pipe", ...(options.lockHold?.fds ?? [])],
+        env: buildAgySpawnEnv(),
+        detached: process.platform !== "win32",
+      }) as ChildProcessWithoutNullStreams
+    } catch (err) {
+      this.unlock?.()
+      throw err
+    }
 
     this.proc.stdin.on("error", (err) => {
       this.closed = true
@@ -539,6 +551,7 @@ export class AcpProcess {
 
     this.proc.on("error", (err) => {
       this.closed = true
+      this.unlock?.()
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
         this.failAllPending(new AgyNotFoundError(binary))
         return
@@ -548,6 +561,7 @@ export class AcpProcess {
 
     this.proc.on("exit", (code, signal) => {
       this.closed = true
+      this.unlock?.()
       const tail = this.stderrLines.join("\n")
       this.failAllPending(
         new Error(
@@ -559,6 +573,7 @@ export class AcpProcess {
 
     this.proc.on("close", (code, signal) => {
       this.closed = true
+      this.unlock?.()
       const tail = this.stderrLines.join("\n")
       this.failAllPending(
         new Error(

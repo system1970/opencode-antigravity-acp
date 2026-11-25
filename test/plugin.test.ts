@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -29,12 +29,25 @@ import {
   stripUnsafeInternalLines,
 } from "../src/history-sanitizer.js"
 import { McpRelayServer } from "../src/mcp-relay.js"
+import { acquireConversationLock, closeLockFd } from "../src/conversation-lock.js"
 import { elicitationToQuestions, parseQuestionToolAnswers } from "../src/question-bridge.js"
 import {
   SessionBridgeManager,
   quotaBucketForModel,
   resetSharedCatalogForTests,
 } from "../src/session-bridge.js"
+
+const originalHome = process.env.HOME
+let testHome: string
+beforeAll(() => {
+  testHome = fs.mkdtempSync(path.join(os.tmpdir(), "acp-test-home-"))
+  process.env.HOME = testHome
+})
+afterAll(() => {
+  if (originalHome === undefined) delete process.env.HOME
+  else process.env.HOME = originalHome
+  fs.rmSync(testHome, { recursive: true, force: true })
+})
 
 function makeMockCtx(initialStorage?: Record<string, unknown>) {
   const store = new Map<string, unknown>(Object.entries(initialStorage ?? {}))
@@ -73,6 +86,217 @@ async function waitFor(cond: () => boolean, ms = 5000): Promise<void> {
     await new Promise((r) => setTimeout(r, 10))
   }
 }
+
+describe("single writer per conversation", () => {
+  test.skipIf(process.platform !== "linux")("stale-install retry maps lock contention to a stopped stream", async () => {
+    const id = "retry-lock-busy"
+    const held = await acquireConversationLock("session", id)
+    expect(held.kind).toBe("held")
+    if (held.kind !== "held") throw new Error("test lock unavailable")
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp")
+    const session = (bridge as any).getOrCreateSession(id)
+    let busyError: unknown
+    try { await (bridge as any).claimReset(session) } catch (err) { busyError = err }
+    closeLockFd(held.fd)
+    expect(busyError).toBeDefined()
+    let attempts = 0
+    let prompts = 0
+    ;(bridge as any).ensureAcpSession = async () => {
+      if (++attempts === 2) throw busyError
+      return { proc: { setModel: async () => { session.startGeneration++ }, prompt: async () => { prompts++; return { stopReason: "end_turn" } } }, acpSessionId: "native", freshSession: false }
+    }
+    try {
+      const parts = await readAllParts((await bridge.createLanguageModel("gemini-4-neon").doStream({
+        headers: { "x-opencode-session-id": id },
+        prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      } as any)).stream)
+      expect(attempts).toBe(2)
+      expect(prompts).toBe(0)
+      expect(parts.at(-1)).toMatchObject({ finishReason: { raw: "agy_session_busy" } })
+    } finally { await bridge.disposeAll() }
+  })
+
+  test.skipIf(process.platform !== "linux")("refused handoff stops even if the owner releases immediately", async () => {
+    const id = "handoff-refused"
+    const held = await acquireConversationLock("session", id)
+    expect(held.kind).toBe("held")
+    if (held.kind !== "held") throw new Error("test lock unavailable")
+    let fdOpen = true
+    let starts = 0
+    let ensures = 0
+    const ctx = makeMockCtx({ [`antigravity-acp:session:${id}`]: "old-native" })
+    const bridge = new SessionBridgeManager(ctx, "/tmp", undefined, { createProc: () => {
+      starts++
+      return { isClosed: false, initialize: async () => ({}), authenticate: async () => ({}),
+        resumeSession: async ({ sessionId }: any) => ({ sessionId }), setModel: async () => {}, setMode: async () => {},
+        prompt: async () => ({ stopReason: "end_turn" }), dispose: async () => {} } as any
+    } })
+    const originalClaim = (bridge as any).claimReset.bind(bridge)
+    const originalEnsure = (bridge as any).ensureAcpSession.bind(bridge)
+    ;(bridge as any).ensureAcpSession = (...args: any[]) => { ensures++; return originalEnsure(...args) }
+    ;(bridge as any).claimReset = async (...args: any[]) => {
+      try { return await originalClaim(...args) } catch (err) {
+        closeLockFd(held.fd); fdOpen = false
+        throw err
+      }
+    }
+    try {
+      const parts = await readAllParts((await bridge.createLanguageModel("gemini-4-neon").doStream({
+        headers: { "x-opencode-session-id": id },
+        prompt: [
+          { role: "user", content: [{ type: "text", text: "hello" }] },
+          { role: "assistant", content: [{ type: "text", text: "foreign reply" }] },
+          { role: "user", content: [{ type: "text", text: "continue" }] },
+        ],
+      } as any)).stream)
+      expect(fdOpen).toBe(false)
+      expect(ensures).toBe(0)
+      expect(starts).toBe(0)
+      expect(parts.at(-1)).toMatchObject({ finishReason: { raw: "agy_session_busy" } })
+      expect(await Effect.runPromise(ctx.storage.get(`antigravity-acp:session:${id}`))).toBe("old-native")
+    } finally { if (fdOpen) closeLockFd(held.fd); await bridge.disposeAll() }
+  })
+
+  test.skipIf(process.platform !== "linux")("fresh mapping stays locked through reset removal", async () => {
+    const key = "antigravity-acp:session:fresh-lock"
+    const ctx = makeMockCtx()
+    const remove = ctx.storage.remove
+    let releaseRemove!: () => void
+    let removing = false
+    const gate = new Promise<void>((r) => { releaseRemove = r })
+    ctx.storage.remove = (k: string) => k === key ? Effect.promise(async () => {
+      removing = true
+      await gate
+      await Effect.runPromise(remove(k))
+    }) : remove(k)
+    let starts = 0
+    const createProc = (options: any) => {
+      const number = ++starts
+      const release = options.lockHold?.ref()
+      return { isClosed: false, initialize: async () => ({}), authenticate: async () => ({}),
+        newSession: async () => ({ sessionId: `fresh-native-${number}` }),
+        resumeSession: async ({ sessionId }: any) => ({ sessionId }),
+        setModel: async () => {}, setMode: async () => {}, prompt: async () => ({ stopReason: "end_turn" }),
+        closeSession: async () => {}, dispose: async () => { release?.() } } as any
+    }
+    const a = new SessionBridgeManager(ctx, "/tmp", undefined, { createProc })
+    const b = new SessionBridgeManager(ctx, "/tmp", undefined, { createProc })
+    const run = async (bridge: SessionBridgeManager) => readAllParts((await bridge.createLanguageModel("gemini-4-neon").doStream({ headers: { "x-opencode-session-id": "fresh-lock" }, prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }] } as any)).stream)
+    try {
+      await run(a)
+      expect(await Effect.runPromise(ctx.storage.get(key))).toBe("fresh-native-1")
+      expect((await run(b)).at(-1)).toMatchObject({ finishReason: { raw: "agy_session_busy" } })
+      const reset = a.resetSession("fresh-lock")
+      await waitFor(() => removing)
+      expect((await run(b)).at(-1)).toMatchObject({ finishReason: { raw: "agy_session_busy" } })
+      expect(await Effect.runPromise(ctx.storage.get(key))).toBe("fresh-native-1")
+      releaseRemove()
+      await reset
+      await run(b)
+      expect(starts).toBe(2)
+      expect(await Effect.runPromise(ctx.storage.get(key))).toBe("fresh-native-2")
+    } finally { releaseRemove(); await a.disposeAll(); await b.disposeAll() }
+  })
+
+  test.skipIf(process.platform !== "linux")("guarded storage read failure starts no child and leaves the mapping unchanged", async () => {
+    const key = "antigravity-acp:session:read-failure"
+    const ctx = makeMockCtx({ [key]: "stored-native" })
+    const get = ctx.storage.get
+    ctx.storage.get = (k: string) => k === key ? Effect.fail(new Error("read failed")) : get(k)
+    let starts = 0
+    const bridge = new SessionBridgeManager(ctx, "/tmp", undefined, { createProc: () => { starts++; throw new Error("unexpected spawn") } })
+    try {
+      const parts = await readAllParts((await bridge.createLanguageModel("gemini-4-neon").doStream({ headers: { "x-opencode-session-id": "read-failure" }, prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }] } as any)).stream)
+      expect(starts).toBe(0)
+      expect(await Effect.runPromise(get(key))).toBe("stored-native")
+      expect(parts.at(-1)).toMatchObject({ finishReason: { raw: "agy_lock_unavailable" } })
+    } finally { await bridge.disposeAll() }
+  })
+
+  test.skipIf(process.platform !== "linux")("rejects native aliases until the owner releases", async () => {
+    const ctx = makeMockCtx({ "antigravity-acp:session:alias-a": "shared-native", "antigravity-acp:session:alias-b": "shared-native" })
+    let starts = 0
+    let resumes = 0
+    const createProc = (options: any) => {
+      starts++
+      const release = options.lockHold?.ref()
+      return { isClosed: false, initialize: async () => ({}), authenticate: async () => ({}),
+        resumeSession: async ({ sessionId }: any) => { resumes++; return { sessionId } },
+        setModel: async () => {}, setMode: async () => {}, prompt: async () => ({ stopReason: "end_turn" }),
+        closeSession: async () => {}, dispose: async () => { release?.() } } as any
+    }
+    const a = new SessionBridgeManager(ctx, "/tmp", undefined, { createProc })
+    const b = new SessionBridgeManager(ctx, "/tmp", undefined, { createProc })
+    const run = async (bridge: SessionBridgeManager, id: string) => readAllParts((await bridge.createLanguageModel("gemini-4-neon").doStream({ headers: { "x-opencode-session-id": id }, prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }] } as any)).stream)
+    try {
+      await run(a, "alias-a")
+      const rejected = await run(b, "alias-b")
+      expect(starts).toBe(1)
+      expect(resumes).toBe(1)
+      expect(rejected.at(-1)).toMatchObject({ type: "finish", finishReason: { raw: "agy_session_busy" } })
+      const reset = await b.resetSession("alias-b")
+      expect(reset.lastError).toContain("was not reset")
+      expect(await Effect.runPromise(ctx.storage.get("antigravity-acp:session:alias-b"))).toBe("shared-native")
+      await a.disposeAll()
+      await run(b, "alias-b")
+      expect(resumes).toBe(2)
+    } finally { await a.disposeAll(); await b.disposeAll() }
+  })
+
+  test.skipIf(process.platform !== "linux")("fails closed when the profile is unavailable", async () => {
+    const oldHome = process.env.HOME
+    process.env.HOME = "/nonexistent-profile-for-acp-lock-test"
+    let starts = 0
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp", undefined, { createProc: () => { starts++; throw new Error("unexpected spawn") } })
+    try {
+      const parts = await readAllParts((await bridge.createLanguageModel("gemini-4-neon").doStream({ headers: { "x-opencode-session-id": "unavailable" }, prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }] } as any)).stream)
+      expect(starts).toBe(0)
+      expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { raw: "agy_lock_unavailable" } })
+    } finally { if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome; await bridge.disposeAll() }
+  })
+
+  test.skipIf(process.platform !== "linux")("rejects a second bridge before resuming a shared session", async () => {
+    const id = "single-writer-test"
+    const key = `antigravity-acp:session:${id}`
+    const ctx = makeMockCtx({ [key]: "native-test" })
+    let resumes = 0
+    let starts = 0
+    const createProc = (options: any) => {
+      starts++
+      const release = options.lockHold?.ref()
+      return {
+        isClosed: false,
+        initialize: async () => ({}),
+        authenticate: async () => ({}),
+        resumeSession: async ({ sessionId }: any) => { resumes++; return { sessionId } },
+        setModel: async () => {},
+        setMode: async () => {},
+        prompt: async () => ({ stopReason: "end_turn" }),
+        closeSession: async () => {},
+        dispose: async () => { release?.() },
+      } as any
+    }
+    const a = new SessionBridgeManager(ctx, "/tmp", undefined, { createProc })
+    const b = new SessionBridgeManager(ctx, "/tmp", undefined, { createProc })
+    const headers = { "x-opencode-session-id": id }
+    const prompt = [{ role: "user", content: [{ type: "text", text: "hello" }] }]
+    try {
+      await readAllParts((await a.createLanguageModel("gemini-4-neon").doStream({ headers, prompt } as any)).stream)
+      const second = await readAllParts((await b.createLanguageModel("gemini-4-neon").doStream({ headers, prompt } as any)).stream)
+      expect(resumes).toBe(1)
+      expect(starts).toBe(1)
+      expect(second.at(-1)).toMatchObject({ type: "finish", finishReason: { raw: "agy_session_busy" } })
+      expect(await Effect.runPromise(ctx.storage.get(key))).toBe("native-test")
+      await a.disposeAll()
+      await readAllParts((await b.createLanguageModel("gemini-4-neon").doStream({ headers, prompt } as any)).stream)
+      expect(starts).toBe(2)
+      expect(resumes).toBe(2)
+    } finally {
+      await a.disposeAll()
+      await b.disposeAll()
+    }
+  })
+})
 
 describe("resolveAgyBinary & missing binary handling", () => {
   test("respects AGY_BIN env override", () => {
@@ -1176,6 +1400,13 @@ describe("History sanitizer & cross-model context handoff", () => {
     })
 
     await bridge.warmSession("")
+    if (process.platform === "linux") {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(factoryCalls).toHaveLength(0)
+      expect((bridge as any).warmSpare).toBeUndefined()
+      await bridge.disposeAll()
+      return
+    }
     await waitFor(() => (bridge as any).warmSpare?.proc !== undefined)
     expect(factoryCalls.length).toBe(1)
     const spare = factoryCalls[0]
@@ -1190,16 +1421,17 @@ describe("History sanitizer & cross-model context handoff", () => {
     const parts = await readAllParts(res.stream)
     expect(parts.some((p) => p.type === "error")).toBe(false)
     expect(parts.find((p) => p.type === "finish")?.finishReason?.unified).toBe("stop")
-    expect(factoryCalls.length).toBe(1)
-    expect((bridge as any).warmSpare).toBeUndefined()
-    expect((bridge as any).getOrCreateSession("ses-claim-1").proc).toBe(spare)
-    expect(spare._prompts).toHaveLength(1)
+    const guarded = process.platform === "linux"
+    expect(factoryCalls.length).toBe(guarded ? 2 : 1)
+    expect((bridge as any).warmSpare?.proc).toBe(guarded ? spare : undefined)
+    expect((bridge as any).getOrCreateSession("ses-claim-1").proc).toBe(guarded ? factoryCalls[1] : spare)
+    expect((guarded ? factoryCalls[1] : spare)._prompts).toHaveLength(1)
 
     // Park another spare, then dispose: the unclaimed spare must be disposed, zero leaks.
     await bridge.warmSession("")
     await waitFor(() => (bridge as any).warmSpare?.proc !== undefined)
     expect(factoryCalls.length).toBe(2)
-    const spare2 = factoryCalls[1]
+    const spare2 = guarded ? spare : factoryCalls[1]
     await bridge.disposeAll()
     expect(spare2.disposed).toBe(true)
     expect((bridge as any).warmSpare).toBeUndefined()
@@ -1220,6 +1452,26 @@ describe("History sanitizer & cross-model context handoff", () => {
     await bridge.warmSession("")
     expect(spawns).toBe(0)
     await bridge.disposeAll()
+  })
+
+  test("contextless warm still starts a spare on non-Linux", async () => {
+    const platform = process.platform
+    let starts = 0
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp", undefined, {
+      createProc: () => {
+        starts++
+        return { isClosed: false, initialize: async () => ({}), authenticate: async () => ({}), dispose: async () => {} } as any
+      },
+    })
+    try {
+      Object.defineProperty(process, "platform", { value: "darwin" })
+      await bridge.warmSession("")
+      await waitFor(() => (bridge as any).warmSpare?.proc !== undefined)
+      expect(starts).toBe(1)
+    } finally {
+      Object.defineProperty(process, "platform", { value: platform })
+      await bridge.disposeAll()
+    }
   })
 
   test("warmSession does not reinstall after a reset invalidates it", async () => {
@@ -1621,7 +1873,7 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     // barrier — no second spawn, and storage hasn't been read yet.
     expect(factoryCalls.length).toBe(1)
     expect(factoryCalls[0].disposed).toBe(true)
-    expect(events.filter((e) => e === `get:${SESSION_KEY}`).length).toBe(0)
+    expect(events.filter((e) => e === `get:${SESSION_KEY}`).length).toBe(process.platform === "linux" ? 1 : 0)
     expect(events).toContain(`remove-start:${SESSION_KEY}`)
     // Release cleanup; the retry may now read storage and spawn fresh.
     releaseRemove()
@@ -1630,7 +1882,7 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     expect(factoryCalls.length).toBe(2)
     expect(ensured.proc).toBe(factoryCalls[1])
     expect((bridge as any).getOrCreateSession(SESSION_ID).proc).toBe(factoryCalls[1])
-    const readIdx = events.findIndex((e) => e === `get:${SESSION_KEY}`)
+    const readIdx = events.lastIndexOf(`get:${SESSION_KEY}`)
     const removeEndIdx = events.indexOf(`remove-end:${SESSION_KEY}`)
     expect(removeEndIdx).toBeGreaterThanOrEqual(0)
     expect(readIdx).toBeGreaterThan(removeEndIdx)
